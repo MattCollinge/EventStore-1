@@ -29,13 +29,15 @@
 using System;
 using System.Collections.Generic;
 using EventStore.Common.Log;
+using EventStore.Core.Bus;
 using EventStore.Core.Data;
 using EventStore.Core.Messages;
+using EventStore.Core.Messaging;
 using EventStore.Projections.Core.Messages;
 
 namespace EventStore.Projections.Core.Services.Processing
 {
-    public class EmittedStream : IDisposable
+    public class EmittedStream : IDisposable, IHandle<CoreProjectionProcessingMessage.EmittedStreamWriteCompleted>
     {
         private readonly
             RequestResponseDispatcher<ClientMessage.ReadStreamEventsBackward, ClientMessage.ReadStreamEventsBackwardCompleted>
@@ -52,11 +54,11 @@ namespace EventStore.Projections.Core.Services.Processing
         private readonly IEmittedStreamContainer _readyHandler;
 
         private readonly Stack<Tuple<CheckpointTag, string, int>> _alreadyCommittedEvents = new Stack<Tuple<CheckpointTag, string, int>>();
-        private readonly Queue<EmittedEvent> _pendingWrites =
-            new Queue<EmittedEvent>();
+        private readonly Queue<EmittedEvent> _pendingWrites = new Queue<EmittedEvent>();
 
         private bool _checkpointRequested;
         private bool _awaitingWriteCompleted;
+        private bool _awaitingReady;
         private bool _awaitingListEventsCompleted;
         private bool _started;
 
@@ -68,6 +70,7 @@ namespace EventStore.Projections.Core.Services.Processing
         private readonly bool _noCheckpoints;
         private bool _disposed;
         private CheckpointTag _last;
+        private bool _recoveryCompleted;
 
 
         public EmittedStream(
@@ -100,13 +103,20 @@ namespace EventStore.Projections.Core.Services.Processing
         public void EmitEvents(EmittedEvent[] events)
         {
             if (events == null) throw new ArgumentNullException("events");
+            CheckpointTag groupCausedBy = null;
             foreach (var @event in events)
             {
+                if (groupCausedBy == null)
+                {
+                    groupCausedBy = @event.CausedByTag;
+                    if (groupCausedBy < _last)
+                        throw new InvalidOperationException(string.Format("Invalid event order.  '{0}' goes after '{1}'", @event.CausedByTag, _last));
+                    _last = groupCausedBy;
+                }
+                else if (@event.CausedByTag != groupCausedBy)
+                    throw new ArgumentException("events must share the same CausedByTag");
                 if (@event.StreamId != _streamId)
                     throw new ArgumentException("Invalid streamId", "events");
-                if (@event.CausedByTag < _last)
-                    throw new InvalidOperationException(string.Format("Invalid event order.  '{0}' goes after '{1}'", @event.CausedByTag, _last));
-                _last = @event.CausedByTag;
             }
             EnsureCheckpointNotRequested();
             foreach (var @event in events)
@@ -147,7 +157,7 @@ namespace EventStore.Projections.Core.Services.Processing
             return _awaitingListEventsCompleted ? 1 : 0;
         }
 
-        private void Handle(ClientMessage.WriteEventsCompleted message)
+        public void Handle(ClientMessage.WriteEventsCompleted message)
         {
             if (!_awaitingWriteCompleted)
                 throw new InvalidOperationException("WriteEvents has not been submitted");
@@ -276,7 +286,8 @@ namespace EventStore.Projections.Core.Services.Processing
                 var e = _pendingWrites.Peek();
                 if (!e.IsReady())
                 {
-                    _readyHandler.Handle(new CoreProjectionProcessingMessage.EmittedStreamAwaiting(_streamId));
+                    _readyHandler.Handle(new CoreProjectionProcessingMessage.EmittedStreamAwaiting(_streamId, new SendToThisEnvelope(this)));
+                    _awaitingReady = true;
                     break;
                 }
                 _pendingWrites.Dequeue();
@@ -299,7 +310,10 @@ namespace EventStore.Projections.Core.Services.Processing
             _submittedToWriteEvents = events.ToArray();
             _submittedToWriteEmittedEvents = emittedEvents.ToArray();
 
-            PublishWriteEvents();
+            if (_submittedToWriteEvents.Length > 0)
+                PublishWriteEvents();
+            else
+                _awaitingWriteCompleted = false;
         }
 
         private bool DetectConcurrencyViolations(CheckpointTag expectedTag)
@@ -365,8 +379,10 @@ namespace EventStore.Projections.Core.Services.Processing
             bool anyFound = false;
             while (_pendingWrites.Count > 0)
             {
-                var eventsToWrite = _pendingWrites.Peek();
-                if (eventsToWrite.CausedByTag > _lastSubmittedOrCommittedMetadata)
+                var eventToWrite = _pendingWrites.Peek();
+                if (eventToWrite.CausedByTag > _lastSubmittedOrCommittedMetadata || _alreadyCommittedEvents.Count == 0)
+                    RecoveryCompleted();
+                if (_recoveryCompleted)
                 {
                     if (anyFound)
                         NotifyWriteCompleted(); // unlock pending write-resolves if any
@@ -374,18 +390,26 @@ namespace EventStore.Projections.Core.Services.Processing
                     return;
                 }
                 var topAlreadyCommitted = _alreadyCommittedEvents.Pop();
-                if (topAlreadyCommitted.Item1 != eventsToWrite.CausedByTag
-                    || topAlreadyCommitted.Item2 != eventsToWrite.EventType)
-                    throw new InvalidOperationException(
-                        string.Format(
-                            "An event emitted in recovery differ from the originally emitted event.  Existing('{0}', '{1}'). New('{2}', '{3}')",
-                            topAlreadyCommitted.Item2, topAlreadyCommitted.Item1, eventsToWrite.EventType,
-                            eventsToWrite.CausedByTag));
+                ValidateEmittedEventInRecoveryMode(topAlreadyCommitted, eventToWrite);
                 anyFound = true;
-                NotifyEventCommitted(eventsToWrite, topAlreadyCommitted.Item3); 
+                NotifyEventCommitted(eventToWrite, topAlreadyCommitted.Item3); 
                 _pendingWrites.Dequeue(); // drop already committed event
             }
             OnWriteCompleted();
+        }
+
+        private static void ValidateEmittedEventInRecoveryMode(Tuple<CheckpointTag, string, int> topAlreadyCommitted, EmittedEvent eventsToWrite)
+        {
+            if (topAlreadyCommitted.Item1 != eventsToWrite.CausedByTag || topAlreadyCommitted.Item2 != eventsToWrite.EventType)
+                throw new InvalidOperationException(
+                    string.Format(
+                        "An event emitted in recovery differ from the originally emitted event.  Existing('{0}', '{1}'). New('{2}', '{3}')",
+                        topAlreadyCommitted.Item2, topAlreadyCommitted.Item1, eventsToWrite.EventType, eventsToWrite.CausedByTag));
+        }
+
+        private void RecoveryCompleted()
+        {
+            _recoveryCompleted = true;
         }
 
         private static void NotifyEventsCommitted(EmittedEvent[] events, int firstEventNumber)
@@ -406,9 +430,11 @@ namespace EventStore.Projections.Core.Services.Processing
             _disposed = true;
         }
 
-        public void RetryAwaitingWrites()
+        public void Handle(CoreProjectionProcessingMessage.EmittedStreamWriteCompleted message)
         {
-            throw new NotImplementedException();
+            if (!_awaitingReady)
+                throw new InvalidOperationException("AwaitingReady state required");
+            ProcessWrites();
         }
     }
 }
